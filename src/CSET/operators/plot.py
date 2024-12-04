@@ -15,6 +15,7 @@
 """Operators to produce various kinds of plots."""
 
 import fcntl
+import functools
 import importlib.resources
 import json
 import logging
@@ -34,6 +35,9 @@ from markdown_it import MarkdownIt
 
 from CSET._common import get_recipe_metadata, render_file, slugify
 from CSET.operators._utils import get_cube_yxcoordname, is_transect
+
+# Use a non-interactive plotting backend.
+mpl.use("agg")
 
 ############################
 # Private helper functions #
@@ -84,19 +88,28 @@ def _check_single_cube(cube: iris.cube.Cube | iris.cube.CubeList) -> iris.cube.C
     raise TypeError("Must have a single cube", cube)
 
 
+def _py312_importlib_resources_files_shim():
+    """Importlib behaviour changed in 3.12 to avoid circular dependencies.
+
+    This shim is needed until python 3.12 is our oldest supported version, after
+    which it can just be replaced by directly using importlib.resources.files.
+    """
+    if sys.version_info.minor >= 12:
+        files = importlib.resources.files()
+    else:
+        import CSET.operators
+
+        files = importlib.resources.files(CSET.operators)
+    return files
+
+
 def _make_plot_html_page(plots: list):
     """Create a HTML page to display a plot image."""
     # Debug check that plots actually contains some strings.
     assert isinstance(plots[0], str)
 
     # Load HTML template file.
-    # Importlib behaviour changed in 3.12 to avoid circular dependencies.
-    if sys.version_info.minor >= 12:
-        operator_files = importlib.resources.files()
-    else:
-        import CSET.operators
-
-        operator_files = importlib.resources.files(CSET.operators)
+    operator_files = _py312_importlib_resources_files_shim()
     template_file = operator_files.joinpath("_plot_page_template.html")
 
     # Get some metadata.
@@ -121,9 +134,29 @@ def _make_plot_html_page(plots: list):
         fp.write(html)
 
 
-def _colorbar_map_levels(varname: str, **kwargs):
+@functools.cache
+def _load_colorbar_map() -> dict:
+    """Load the colorbar definitions from a file.
+
+    This is a separate function to make it cacheable.
     """
-    Specify the color map and levels.
+    # Grab the colorbar file from the recipe global metadata.
+    try:
+        colorbar_file = get_recipe_metadata()["style_file_path"]
+        logging.debug("Colour bar file: %s", colorbar_file)
+        with open(colorbar_file, "rt", encoding="UTF-8") as fp:
+            colorbar = json.load(fp)
+    except (FileNotFoundError, KeyError):
+        logging.info("Colorbar file does not exist. Using default values.")
+        operator_files = _py312_importlib_resources_files_shim()
+        colorbar_def_file = operator_files.joinpath("_colorbar_definition.json")
+        with open(colorbar_def_file, "rt", encoding="UTF-8") as fp:
+            colorbar = json.load(fp)
+    return colorbar
+
+
+def _colorbar_map_levels(varname: str, **kwargs):
+    """Specify the color map and levels.
 
     For the given variable name, from a colorbar dictionary file.
 
@@ -134,47 +167,42 @@ def _colorbar_map_levels(varname: str, **kwargs):
     varname: str
         Variable name to extract from the dictionary
 
+    Returns
+    -------
+    cmap:
+        Matplotlib colormap.
+    levels:
+        List of levels to use for plotting. For continuous plots the min and max
+        should be taken as the range.
+    norm:
+        BoundryNorm information.
     """
-    # Grab the colour bar file from the recipe global metadata. A non-existent
-    # placeholder path is used if not found.
-    colorbar_file = get_recipe_metadata().get(
-        "style_file_path", "/non-existent/NO_FILE_SPECIFIED"
-    )
+    colorbar = _load_colorbar_map()
+
+    # Get the colormap for this variable.
     try:
-        with open(colorbar_file, "rt", encoding="UTF-8") as fp:
-            colorbar = json.load(fp)
-
-        # Specify the colormap for this variable
-        try:
-            cmap = colorbar[varname]["cmap"]
-            logging.debug("From color_bar dictionary: Using cmap")
-        except KeyError:
-            cmap = mpl.colormaps["viridis"]
-
-        # Specify the colorbar levels for this variable
-        try:
-            levels = colorbar[varname]["levels"]
-
-            actual_cmap = mpl.cm.get_cmap(cmap)
-
-            norm = mpl.colors.BoundaryNorm(levels, ncolors=actual_cmap.N)
-            logging.debug("From color_bar dictionary: Using levels")
-        except KeyError:
-            try:
-                vmin, vmax = colorbar[varname]["min"], colorbar[varname]["max"]
-                logging.debug("From color_bar dictionary: Using min and max")
-                levels = np.linspace(vmin, vmax, 20)
-                norm = None
-            except KeyError:
-                levels = None
-                norm = None
-
-    except FileNotFoundError:
-        logging.debug("Colour bar file: %s", colorbar_file)
-        logging.info("Colour bar file does not exist. Using default values.")
-        levels = None
-        norm = None
+        cmap = colorbar[varname]["cmap"]
+        logging.debug("From colorbar dictionary: Using cmap")
+    except KeyError:
         cmap = mpl.colormaps["viridis"]
+
+    # Get the colorbar levels for this variable.
+    try:
+        levels = colorbar[varname]["levels"]
+        actual_cmap = mpl.cm.get_cmap(cmap)
+        norm = mpl.colors.BoundaryNorm(levels, ncolors=actual_cmap.N)
+        logging.debug("From colorbar dictionary: Using levels")
+    except KeyError:
+        try:
+            # Get the range for this variable.
+            vmin, vmax = colorbar[varname]["min"], colorbar[varname]["max"]
+            logging.debug("From colorbar dictionary: Using min and max")
+            # Calculate levels from range.
+            levels = np.linspace(vmin, vmax, 20)
+            norm = None
+        except KeyError:
+            levels = None
+            norm = None
 
     return cmap, levels, norm
 
@@ -205,7 +233,7 @@ def _plot_and_save_spatial_plot(
         The plotting method to use.
     """
     # Setup plot details, size, resolution, etc.
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
 
     # Specify the color bar
     cmap, levels, norm = _colorbar_map_levels(cube.name())
@@ -214,8 +242,13 @@ def _plot_and_save_spatial_plot(
         # Filled contour plot of the field.
         plot = iplt.contourf(cube, cmap=cmap, levels=levels, norm=norm)
     elif method == "pcolormesh":
+        try:
+            vmin = min(levels)
+            vmax = max(levels)
+        except TypeError:
+            vmin, vmax = None, None
         # pcolormesh plot of the field.
-        plot = iplt.pcolormesh(cube, cmap=cmap, norm=norm)
+        plot = iplt.pcolormesh(cube, cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
     else:
         raise ValueError(f"Unknown plotting method: {method}")
 
@@ -252,8 +285,18 @@ def _plot_and_save_spatial_plot(
         ):
             axes.set_yscale("log")
 
-    # Add title.
-    axes.set_title(title, fontsize=16)
+        axes.set_title(
+            f'{title}\n'
+            f'Start Lat: {cube.attributes["transect_coords"].split("_")[0]}'
+            f' Start Lon: {cube.attributes["transect_coords"].split("_")[1]}'
+            f' End Lat: {cube.attributes["transect_coords"].split("_")[2]}'
+            f' End Lon: {cube.attributes["transect_coords"].split("_")[3]}',
+            fontsize=16,
+        )
+
+    else:
+        # Add title.
+        axes.set_title(title, fontsize=16)
 
     # Add watermark with min/max/mean. Currently not user toggable.
     # In the bbox dictionary, fc and ec are hex colour codes for grey shade.
@@ -308,7 +351,7 @@ def _plot_and_save_postage_stamp_spatial_plot(
     # Use the smallest square grid that will fit the members.
     grid_size = int(math.ceil(math.sqrt(len(cube.coord(stamp_coordinate).points))))
 
-    fig = plt.figure(figsize=(8, 8))
+    fig = plt.figure(figsize=(10, 10))
 
     # Specify the color bar
     cmap, levels, norm = _colorbar_map_levels(cube.name())
@@ -324,8 +367,13 @@ def _plot_and_save_postage_stamp_spatial_plot(
             # Filled contour plot of the field.
             plot = iplt.contourf(member, cmap=cmap, levels=levels, norm=norm)
         elif method == "pcolormesh":
+            try:
+                vmin = min(levels)
+                vmax = max(levels)
+            except TypeError:
+                vmin, vmax = None, None
             # pcolormesh plot of the field.
-            plot = iplt.pcolormesh(member, cmap=cmap, norm=norm)
+            plot = iplt.pcolormesh(member, cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
         else:
             raise ValueError(f"Unknown plotting method: {method}")
         ax = plt.gca()
@@ -378,7 +426,7 @@ def _plot_and_save_line_series(
     title: str
         Plot title.
     """
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
     iplt.plot(coord, cube, "o-")
     ax = plt.gca()
 
@@ -428,7 +476,7 @@ def _plot_and_save_vertical_line_series(
         Maximum value for the x-axis.
     """
     # plot the vertical pressure axis using log scale
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
     iplt.plot(cube, coord, "o-")
     ax = plt.gca()
 
@@ -510,7 +558,7 @@ def _plot_and_save_scatter_plot(
     one_to_one: bool
         Whether a 1:1 line is plotted.
     """
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
     iplt.scatter(cube_x, cube_y)
     if one_to_one is True:
         plt.plot(
@@ -580,7 +628,7 @@ def _plot_and_save_histogram_series(
         histogram or "barstacked", "stepfilled". "Step" is the default option,
         but can be changed in the rose-suite.conf configuration.
     """
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
     # Reshape cube data into a single array to allow for a single histogram.
     # Otherwise we plot xdim histograms stacked.
     cube_data_1d = (cube.data).flatten()
@@ -646,7 +694,7 @@ def _plot_and_save_postage_stamp_histogram_series(
     # Use the smallest square grid that will fit the members.
     grid_size = int(math.ceil(math.sqrt(len(cube.coord(stamp_coordinate).points))))
 
-    fig = plt.figure(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig = plt.figure(figsize=(10, 10), facecolor="w", edgecolor="k")
     # Make a subplot for each member.
     for member, subplot in zip(
         cube.slices_over(stamp_coordinate), range(1, grid_size**2 + 1), strict=False
@@ -680,7 +728,7 @@ def _plot_and_save_postage_stamps_in_single_plot_histogram_series(
     histtype: str = "step",
     **kwargs,
 ):
-    fig, ax = plt.subplots(figsize=(8, 8), facecolor="w", edgecolor="k")
+    fig, ax = plt.subplots(figsize=(10, 10), facecolor="w", edgecolor="k")
     ax.set_title(title)
     ax.set_xlim(vmin, vmax)
     ax.set_xlabel(f"{cube.name()} / {cube.units}")
@@ -778,7 +826,7 @@ def _spatial_plot(
         plot_filename = f"{filename.rsplit('.', 1)[0]}_{sequence_value}.png"
         coord = cube_slice.coord(sequence_coordinate)
         # Format the coordinate value in a unit appropriate way.
-        title = f"{recipe_title} | {coord.units.title(coord.points[0])}"
+        title = f"{recipe_title}\n{coord.units.title(coord.points[0])}"
         # Do the actual plotting.
         plotting_func(
             cube_slice,
@@ -1029,9 +1077,7 @@ def plot_vertical_line_series(
 
     # Set the lower and upper limit for the x-axis to ensure all plots have same
     # range. This needs to read the whole cube over the range of the sequence
-    # and if applicable postage stamp coordinate. This only works if the
-    # plotting is done in the collate section of a recipe and not in the
-    # parallel section of a recipe.
+    # and if applicable postage stamp coordinate.
     vmin = np.floor(cube.data.min())
     vmax = np.ceil(cube.data.max())
 
@@ -1043,7 +1089,7 @@ def plot_vertical_line_series(
         sequence_value = seq_coord.points[0]
         plot_filename = f"{filename.rsplit('.', 1)[0]}_{sequence_value}.png"
         # Format the coordinate value in a unit appropriate way.
-        title = f"{recipe_title} | {seq_coord.units.title(sequence_value)}"
+        title = f"{recipe_title}\n{seq_coord.units.title(sequence_value)}"
         # Do the actual plotting.
         _plot_and_save_vertical_line_series(
             cube_slice,
@@ -1071,7 +1117,7 @@ def scatter_plot(
     filename: str = None,
     one_to_one: bool = True,
     **kwargs,
-) -> tuple[iris.cube.Cube, iris.cube.Cube]:
+) -> iris.cube.CubeList:
     """Plot a scatter plot between two variables.
 
     Both cubes must be 1D.
@@ -1085,15 +1131,12 @@ def scatter_plot(
     filename: str, optional
         Filename of the plot to write.
     one_to_one: bool, optional
-        If True a 1:1 line is plotted; if False it is not.
-        Default is True.
+        If True a 1:1 line is plotted; if False it is not. Default is True.
 
     Returns
     -------
-    cube_x
-        The original x cube (so further operations can be applied).
-    cube_y
-        The original y cube (so further operations can be applied).
+    cubes: CubeList
+        CubeList of the original x and y cubes for further processing.
 
     Raises
     ------
@@ -1106,18 +1149,17 @@ def scatter_plot(
     Notes
     -----
     Scatter plots are used for determining if there is a relationship between
-    two variables. Positive relations have a slope going from bottom left to
-    top right; Negative relations have a slope going from top left to bottom
-    right.
+    two variables. Positive relations have a slope going from bottom left to top
+    right; Negative relations have a slope going from top left to bottom right.
 
     A variant of the scatter plot is the quantile-quantile plot. This plot does
     not use all data points, but the selected quantiles of each variable
     instead. Quantile-quantile plots are valuable for comparing against
     observations and other models. Identical percentiles between the variables
     will lie on the one-to-one line implying the values correspond well to each
-    other. Where there is a deviation from the one-to-one line a range
-    of possibilities exist depending on how and where the data is shifted
-    (e.g., Wilks 2011 [Wilks2011]_).
+    other. Where there is a deviation from the one-to-one line a range of
+    possibilities exist depending on how and where the data is shifted (e.g.,
+    Wilks 2011 [Wilks2011]_).
 
     For distributions above the one-to-one line the distribution is left-skewed;
     below is right-skewed. A distinct break implies a bimodal distribution, and
@@ -1155,7 +1197,7 @@ def scatter_plot(
     # Make a page to display the plots.
     _make_plot_html_page(plot_index)
 
-    return cube_x, cube_y
+    return iris.cube.CubeList([cube_x, cube_y])
 
 
 def plot_histogram_series(
@@ -1247,9 +1289,7 @@ def plot_histogram_series(
 
     # Set the lower and upper limit for the colorbar to ensure all plots have
     # same range. This needs to read the whole cube over the range of the
-    # sequence and if applicable postage stamp coordinate. This only works if
-    # the plotting is done in the collate section of a recipe and not in the
-    # parallel section of a recipe.
+    # sequence and if applicable postage stamp coordinate.
     vmin = np.floor((cube.data.min()))
     vmax = np.ceil((cube.data.max()))
 
@@ -1261,7 +1301,7 @@ def plot_histogram_series(
         plot_filename = f"{filename.rsplit('.', 1)[0]}_{sequence_value}.png"
         coord = cube_slice.coord(sequence_coordinate)
         # Format the coordinate value in a unit appropriate way.
-        title = f"{recipe_title} | {coord.units.title(coord.points[0])}"
+        title = f"{recipe_title}\n{coord.units.title(coord.points[0])}"
         # Do the actual plotting.
         plotting_func(
             cube_slice,

@@ -26,6 +26,8 @@ import iris.cube
 import iris.util
 import numpy as np
 
+from CSET.operators._stash_to_lfric import STASH_TO_LFRIC
+
 
 class NoDataWarning(UserWarning):
     """Warning that no data has been loaded."""
@@ -192,8 +194,10 @@ def _create_callback(is_ensemble: bool) -> callable:
             _ensemble_callback(cube, field, filename)
         else:
             _deterministic_callback(cube, field, filename)
+        _um_normalise_callback(cube, field, filename)
         _lfric_normalise_callback(cube, field, filename)
         _lfric_time_coord_fix_callback(cube, field, filename)
+        _longitude_fix_callback(cube, field, filename)
 
     return callback
 
@@ -239,6 +243,25 @@ def _deterministic_callback(cube, field, filename):
         )
 
 
+def _um_normalise_callback(cube: iris.cube.Cube, field, filename):
+    """Normalise UM STASH variable long names to LFRic variable names.
+
+    Note standard names will remain associated with cubes where different.
+    Long name will be used consistently in output filename and titles.
+    """
+    # Convert STASH to LFRic variable name
+    if "STASH" in cube.attributes:
+        stash = cube.attributes["STASH"]
+        try:
+            (name, grid) = STASH_TO_LFRIC[str(stash)]
+            cube.long_name = name
+        except KeyError:
+            logging.warning("Unknown STASH code: %s", stash)
+            logging.warning("Please check file stash_to_lfric.py to update.")
+            # Don't change cubes with unknown stash codes.
+            pass
+
+
 def _lfric_normalise_callback(cube: iris.cube.Cube, field, filename):
     """Normalise attributes that prevents LFRic cube from merging.
 
@@ -253,6 +276,7 @@ def _lfric_normalise_callback(cube: iris.cube.Cube, field, filename):
     # Remove unwanted attributes.
     cube.attributes.pop("timeStamp", None)
     cube.attributes.pop("uuid", None)
+    # There might also be a "name" attribute to ditch, which is the filename.
 
     # Sort STASH code list.
     stash_list = cube.attributes.get("um_stash_source")
@@ -268,12 +292,45 @@ def _lfric_time_coord_fix_callback(cube: iris.cube.Cube, field, filename):
     issue, though the coordinate satisfies all the properties for a DimCoord.
     Scalar time values are left as AuxCoords.
     """
+    # This issue seems to come from iris's handling of NetCDF files where time
+    # always ends up as an AuxCoord.
     if cube.coords("time"):
         time_coord = cube.coord("time")
         if not isinstance(time_coord, iris.coords.DimCoord) and cube.coord_dims(
             time_coord
         ):
             iris.util.promote_aux_coord_to_dim_coord(cube, time_coord)
+
+    # Force single-valued coordinates to be scalar coordinates.
+    return iris.util.squeeze(cube)
+
+
+def _longitude_fix_callback(cube: iris.cube.Cube, field, filename):
+    """Check longitude coordinates are in the range -180 deg to 180 deg.
+
+    This is necessary if comparing two models with different conventions --
+    for example, models where the prime meridian is defined as 0 deg or
+    360 deg. If not in the range -180 deg to 180 deg, we wrap the longitude
+    so that it falls in this range.
+    """
+    import CSET.operators._utils as utils
+
+    try:
+        y, x = utils.get_cube_yxcoordname(cube)
+    except ValueError:
+        # Don't modify non-spatial cubes.
+        return cube
+    long_coord = cube.coord(x)
+    long_points = long_coord.points.copy()
+    long_centre = np.median(long_points)
+    while long_centre < -180.0:
+        long_centre += 360.0
+        long_points += 360.0
+    while long_centre >= 180.0:
+        long_centre -= 360.0
+        long_points -= 360.0
+    long_coord.points = long_points
+    return cube
 
 
 def _check_input_files(input_path: Path | str, filename_pattern: str) -> Iterable[Path]:
@@ -298,6 +355,7 @@ def _check_input_files(input_path: Path | str, filename_pattern: str) -> Iterabl
     FileNotFoundError:
         If the provided arguments don't resolve to at least one existing file.
     """
+    logging.debug("Checking '%s' for pattern '%s'", input_path, filename_pattern)
     # Convert string paths into Path objects.
     if isinstance(input_path, str):
         input_path = Path(input_path)
